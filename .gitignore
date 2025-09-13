@@ -1,0 +1,5 @@
+ml_env/
+catboost_info/
+models/
+projectenv/
+src/__pycache__/
