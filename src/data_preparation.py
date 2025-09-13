@@ -7,8 +7,6 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import RandomUnderSampler
 from sklearn.impute import KNNImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -19,7 +17,6 @@ from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
-from imblearn.pipeline import Pipeline as ImbPipeline
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -232,7 +229,7 @@ class DataPreparation:
 
     def build_pipelines_with_resampling(self, df: pd.DataFrame) -> dict:
         """
-        Builds a dictionary of imblearn Pipelines, each containing preprocessing,
+        Builds a dictionary of Pipelines, each containing preprocessing,
         resampling (SMOTE and RandomUnderSampler), and a classifier.
         """
         # Define feature groups
