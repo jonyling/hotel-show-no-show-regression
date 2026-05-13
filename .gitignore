@@ -1,5 +1,31 @@
+# Environments
+.venv/
+venv/
+env/
 ml_env/
-catboost_info/
-models/
 projectenv/
-src/__pycache__/
+
+# Python cache/build output
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Generated model artifacts and run output
+models/
+results/
+catboost_info/
+
+# Local/editor files
+.env
+.DS_Store
+.vscode/
+.idea/

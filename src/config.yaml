@@ -1,10 +1,57 @@
-file_path: './data/mini_project_2_data.csv'
+file_path: data/mini_project_2_data.csv
 target_column: no_show
-val_test_size: 0.2
-test_size: 0.5
-param_grid: 
-  DecisionTree: 
-    classifier__max_depth: [3, 5, 10, null]  # Change 'None' to null
+random_state: 42
+test_size: 0.2
+cv_folds: 5
+scoring: average_precision
+n_iter: 10
+use_gpu: false
+models_dir: models
+results_dir: results
+
+numerical_features:
+  - arrival_day
+  - checkout_day
+  - price
+  - num_adults
+  - num_children
+  - Stay_Duration
+  - booking_lead_time
+  - total_guests
+  - has_children
+  - price_per_person
+  - price_per_night
+  - is_solo_traveler
+  - is_long_stay
+  - is_last_minute_booking
+  - is_international
+  - is_direct_booking
+  - is_peak_season
+
+nominal_features:
+  - branch
+  - country
+  - platform
+  - first_time
+  - Holiday_or_Biz
+
+ordinal_features:
+  - booking_month
+  - arrival_month
+  - checkout_month
+  - room
+
+tuned_models:
+  - DecisionTree
+  - RandomForest
+  - LogisticRegression
+  - XGBoost
+  - LightGBM
+  - CatBoost
+
+param_grid:
+  DecisionTree:
+    classifier__max_depth: [3, 5, 10, null]
     classifier__min_samples_split: [2, 5, 10]
     classifier__min_samples_leaf: [1, 2, 4]
   RandomForest:
@@ -14,7 +61,7 @@ param_grid:
     classifier__min_samples_leaf: [1, 2]
   LogisticRegression:
     classifier__C: [0.01, 0.1, 1, 10]
-    classifier__solver: ['lbfgs', 'saga']
+    classifier__solver: [lbfgs, saga]
   XGBoost:
     classifier__n_estimators: [100, 200]
     classifier__max_depth: [3, 5, 7]
@@ -29,24 +76,3 @@ param_grid:
     classifier__iterations: [100, 200]
     classifier__learning_rate: [0.01, 0.1, 0.3]
     classifier__depth: [4, 6, 8]
-scoring: average_precision  # Update to match sklearn
-numerical_features:
-  - price
-  - booking_lead_time
-  - Stay_Duration
-  - total_cost_of_stay
-nominal_features:
-  - branch
-  - country
-  - platform
-  - first_time
-  - Holiday_or_Biz
-ordinal_features:
-  - booking_month
-  - arrival_month
-  - arrival_day
-  - checkout_month
-  - checkout_day
-  - room
-  - num_adults
-  - num_children

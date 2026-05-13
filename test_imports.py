@@ -1,14 +1,20 @@
+"""Smoke-test project imports."""
+
+import catboost
+import imblearn
+import joblib
+import lightgbm
 import matplotlib
 import numpy
 import pandas
-import yaml
-import sklearn
 import scipy
-import joblib
-import threadpoolctl
-import imblearn
-import xgboost
-import lightgbm
-import catboost
 import seaborn
-print("All dependencies imported successfully")
+import sklearn
+import threadpoolctl
+import xgboost
+import yaml
+
+from src.data_preparation import DataPreparation
+from src.model_training import ModelTraining
+
+print("All dependencies and local modules imported successfully")

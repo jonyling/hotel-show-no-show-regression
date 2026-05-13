@@ -1,246 +1,230 @@
-# Standard library imports
+"""Model construction, training, tuning, evaluation, and persistence."""
+
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, Tuple
+from pathlib import Path
+from typing import Any
 
-# Related third-party imports
-import pandas as pd
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_val_score
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.pipeline import Pipeline
 import joblib
-import os
 import numpy as np
-from sklearn.exceptions import NotFittedError
-from sklearn.metrics import precision_recall_curve, auc, confusion_matrix, classification_report
+import pandas as pd
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+)
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+LOGGER = logging.getLogger(__name__)
+
 
 class ModelTraining:
-    """
-    A class used to train and evaluate machine learning models on predicting no_shows on hotel bookings.
+    """Train and evaluate the classifiers selected in the EDA notebook."""
 
-    Attributes:
-    -----------
-    cconfig : Dict[str, Any]
-        Configuration dictionary containing parameters for model training and evaluation.
-    pipelines : Dict[str, ImbPipeline]
-        Dictionary of preprocessing and model pipelines for each algorithm.
-    """
-
-    def __init__(self, config: Dict[str, Any], pipelines: Dict[str, Pipeline]):
-        """
-        Initialize the ModelTraining class with configuration.
-
-        Args:
-        -----
-        config (Dict[str, Any]): Configuration dictionary containing parameters for model training and evaluation.
-        pipelines: Preprocessor pipelines created in DataPreparation class.
-        """
-        # Validate config
-        if not isinstance(config, dict):
-            raise ValueError("config must be a dictionary")
+    def __init__(self, config: dict[str, Any], preprocessor: Any):
         self.config = config
-        
-        # Validate and set pipelines
-        if not isinstance(pipelines, dict):
-            raise ValueError("pipelines must be a dictionary")
-        if not all(isinstance(pipe, Pipeline) for pipe in pipelines.values()):
-            raise ValueError("All pipeline values must be Pipeline objects")
-        self.pipelines = pipelines
-        
-        if not isinstance(config, dict):
-            raise ValueError("pipelines must be of the correct type")
-            
+        self.preprocessor = preprocessor
+        self.random_state = int(config.get("random_state", 42))
+        self.models_dir = Path(config.get("models_dir", "models"))
+        self.results_dir = Path(config.get("results_dir", "results"))
+        self.cv_folds = int(config.get("cv_folds", 5))
+        self.scoring = config.get("scoring", "average_precision")
+        self.n_iter = int(config.get("n_iter", 10))
+        self.use_gpu = bool(config.get("use_gpu", False))
 
-    def train_and_evaluate_baseline_models(
-        self, 
-        X_train: pd.DataFrame, 
-        y_train: pd.Series, 
-        X_val: pd.DataFrame, 
-        y_val: pd.Series, 
-        pipelines: Dict[str, Pipeline]
-    ) -> Tuple[Dict[str, Pipeline], Dict[str, Dict[str, float]]]:
-        """
-        Train and evaluate baseline models using provided pipelines.
-        
-        Args:
-            X_train: Training features
-            y_train: Training target values
-            X_test: Test features
-            y_test: Test target values
-            pipelines: Dictionary of sklearn pipelines to evaluate
-            
-        Returns:
-            Tuple containing:
-            - Dictionary of trained pipeline objects
-            - Dictionary of evaluation metrics for each model
-        """
-        baseline_metrics = {}
-        baseline_models = {}
-        
+    def build_pipelines(self) -> dict[str, Pipeline]:
+        """Create one preprocessing + classifier pipeline per model."""
+        models = {
+            "DecisionTree": DecisionTreeClassifier(random_state=self.random_state, class_weight="balanced"),
+            "RandomForest": RandomForestClassifier(random_state=self.random_state, class_weight="balanced"),
+            "LogisticRegression": LogisticRegression(
+                max_iter=1000,
+                random_state=self.random_state,
+                class_weight="balanced",
+            ),
+            "XGBoost": XGBClassifier(random_state=self.random_state, n_jobs=1, eval_metric="logloss"),
+            "LightGBM": LGBMClassifier(random_state=self.random_state, n_jobs=1, verbose=-1),
+            "CatBoost": CatBoostClassifier(random_state=self.random_state, verbose=0),
+        }
+
+        if self.use_gpu:
+            self._enable_gpu(models)
+
+        return {
+            name: Pipeline(
+                steps=[
+                    ("preprocessor", clone(self.preprocessor)),
+                    ("classifier", model),
+                ]
+            )
+            for name, model in models.items()
+        }
+
+    def train_baseline_models(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+    ) -> tuple[dict[str, Pipeline], pd.DataFrame]:
+        """Fit default models and evaluate them on the held-out test set."""
+        pipelines = self.build_pipelines()
+        fitted_models: dict[str, Pipeline] = {}
+        metric_rows: list[dict[str, Any]] = []
+
         for name, pipeline in pipelines.items():
-            try:
-                print(f"Fitting {name}...")
-                # Fit the entire pipeline
-                pipeline.fit(X_train, y_train)
-                y_pred = pipeline.predict(X_val)
-                y_pred_proba = pipeline.predict_proba(X_val)[:, 1]  # Probability for no-show (1)
+            LOGGER.info("Fitting baseline %s", name)
+            pipeline.fit(X_train, y_train)
+            metrics = self.evaluate_model(name, pipeline, X_test, y_test)
+            metrics["cv_auc_pr"] = self.cross_validate(pipeline, X_train, y_train)
+            fitted_models[name] = pipeline
+            metric_rows.append(metrics)
+            self.save_model(pipeline, f"{name}.pkl")
+            self.print_report(name, metrics)
 
-                # Calculate AUC-PR
-                precision, recall, _ = precision_recall_curve(y_val, y_pred_proba)
-                auc_pr = auc(recall, precision)
+        metrics_df = self.metrics_to_frame(metric_rows)
+        self.save_metrics(metrics_df, "baseline_metrics.csv")
+        return fitted_models, metrics_df
 
-                # Store metrics
-                baseline_metrics[name] = {
-                    'accuracy': accuracy_score(y_val, y_pred),
-                    'macro_f1': f1_score(y_val, y_pred, average='macro'),
-                    'weighted_f1': f1_score(y_val, y_pred, average='weighted'),
-                    'confusion_matrix': confusion_matrix(y_val, y_pred), 
-                    'auc_pr': auc_pr,
-                }
+    def tune_models(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        model_names: list[str] | None = None,
+    ) -> tuple[dict[str, Pipeline], pd.DataFrame]:
+        """Tune configured models with RandomizedSearchCV and evaluate them."""
+        pipelines = self.build_pipelines()
+        param_grid = self.config.get("param_grid", {})
+        if model_names is None:
+            model_names = list(pipelines)
 
-                # Perform cross-validation
-                cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-                cv_scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='average_precision', n_jobs=1)
-                baseline_metrics[name]['cv_auc_pr'] = cv_scores.mean()  # Use consistent key
+        tuned_models: dict[str, Pipeline] = {}
+        metric_rows: list[dict[str, Any]] = []
+        cv = self.cv_splitter
 
-                # Store the fitted pipeline
-                baseline_models[name] = pipeline  # Add this line
-
-                # Save the trained pipeline
-                os.makedirs('models', exist_ok=True)
-                joblib.dump(pipeline, f'models/{name}.pkl')
-                
-                print(f"\nShow-No_show Report ({name}):")
-                print(classification_report(y_val, y_pred, target_names=['Show', 'No_show']))
-
-            except Exception as e:
-                logging.error(f"Error fitting {name}: {e}")
+        for name in model_names:
+            if name not in pipelines:
+                LOGGER.warning("Skipping unknown model %s", name)
                 continue
 
-        # Print metrics
-        for name, metrics in baseline_metrics.items():
-            print(f"\nModel: {name}")
-            print(f"Accuracy: {metrics['accuracy']:.4f}")
-            print(f"Macro F1: {metrics['macro_f1']:.4f}")
-            print(f"Weighted F1: {metrics['weighted_f1']:.4f}")
-            print(f"CV AUC-PR: {metrics['cv_auc_pr']:.4f}")  # Fix key and label
-            print("Confusion Matrix:")
-            print(metrics['confusion_matrix'])
-            print(f"AUC-PR: {metrics['auc_pr']:.4f}")
-        
-        return baseline_models, baseline_metrics
+            pipeline = pipelines[name]
+            model_params = param_grid.get(name, {})
+            LOGGER.info("Tuning %s", name)
 
-        
+            if model_params:
+                search = RandomizedSearchCV(
+                    pipeline,
+                    param_distributions=model_params,
+                    n_iter=min(self.n_iter, self._parameter_space_size(model_params)),
+                    cv=cv,
+                    scoring=self.scoring,
+                    n_jobs=1,
+                    random_state=self.random_state,
+                )
+                search.fit(X_train, y_train)
+                best_pipeline = search.best_estimator_
+                cv_score = search.best_score_
+                best_params = search.best_params_
+            else:
+                best_pipeline = pipeline.fit(X_train, y_train)
+                cv_score = self.cross_validate(best_pipeline, X_train, y_train)
+                best_params = {}
 
-    def train_and_evaluate_tuned_models(
-        self, 
-        X_train: pd.DataFrame, 
-        y_train: pd.Series, 
-        X_test: pd.DataFrame, 
-        y_test: pd.Series, 
-        top_3_pipelines: Dict[str, Pipeline]
-    ) -> Tuple[Dict[str, Pipeline], Dict[str, Dict[str, float]]]:
-        """
-        Train and evaluate tuned models using provided pipelines.
-        
-        Args:
-            X_train: Training features
-            y_train: Training target values
-            X_test: Validation features
-            y_test: Validation target values
-            top_3_pipelines: Dictionary of top 3 pipelines (by AUC-PR) to tune and evaluate
-            
-        Returns:
-            Tuple containing:
-            - Dictionary of tuned pipeline objects
-            - Dictionary of evaluation metrics for each model
-        """
-        logging.info("Starting hyperparameter tuning.")
-        tuned_models = {}
-        tuned_metrics = {}
-        param_grid = self.config.get("param_grid", {})
-        scoring = self.config.get("scoring", "average_precision")
+            metrics = self.evaluate_model(name, best_pipeline, X_test, y_test)
+            metrics["cv_auc_pr"] = cv_score
+            metrics["best_params"] = best_params
+            tuned_models[name] = best_pipeline
+            metric_rows.append(metrics)
+            self.save_model(best_pipeline, f"tuned_{name}.pkl")
+            self.print_report(name, metrics, tuned=True)
 
-        logging.info(f"Loaded param_grid: {param_grid}")
+        metrics_df = self.metrics_to_frame(metric_rows)
+        self.save_metrics(metrics_df, "tuned_metrics.csv")
+        return tuned_models, metrics_df
 
-        try:
-            for name, pipeline in top_3_pipelines.items():
-                try:
-                    print(f"Fitting {name} with hyperparameter tuning...")
-                    model_param_grid = param_grid.get(name, {})
-                    if not model_param_grid:
-                        logging.warning(f"No param_grid for {name}; using default parameters")
-                        best_pipeline = pipeline
-                        best_pipeline.fit(X_train, y_train)
-                        cv_score = cross_val_score(
-                            best_pipeline, X_train, y_train, 
-                            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42), 
-                            scoring=scoring, n_jobs=-1
-                        ).mean()
-                    else:
-                        # Ensure all param_grid values are lists or arrays
-                        for param, values in model_param_grid.items():
-                            if not isinstance(values, (list, np.ndarray)):
-                                logging.warning(f"Invalid param_grid for {name}, {param}: {values}. Wrapping in list.")
-                                model_param_grid[param] = [values]
-                        # Wrap param_grid in a list to satisfy RandomizedSearchCV
-                        search = RandomizedSearchCV(
-                            pipeline,
-                            param_distributions=[model_param_grid],  # Wrap in list
-                            n_iter=10,
-                            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
-                            scoring=scoring,
-                            n_jobs=-1,
-                            random_state=42
-                        )
-                        search.fit(X_train, y_train)
-                        best_pipeline = search.best_estimator_
-                        cv_score = search.best_score_
-                        print(f"Best parameters for {name}: {search.best_params_}")
+    def evaluate_model(self, name: str, pipeline: Pipeline, X_test: pd.DataFrame, y_test: pd.Series) -> dict[str, Any]:
+        """Calculate threshold and ranking metrics for one fitted model."""
+        y_pred = pipeline.predict(X_test)
+        y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
+        precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
 
-                    # Evaluate on validation set
-                    y_pred = best_pipeline.predict(X_test) # type: ignore[misc]
-                    y_pred_proba = best_pipeline.predict_proba(X_test)[:, 1] # type: ignore[misc]
+        return {
+            "model": name,
+            "accuracy": accuracy_score(y_test, y_pred),
+            "macro_f1": f1_score(y_test, y_pred, average="macro"),
+            "weighted_f1": f1_score(y_test, y_pred, average="weighted"),
+            "auc_pr": auc(recall, precision),
+            "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+            "classification_report": classification_report(
+                y_test,
+                y_pred,
+                target_names=["Show", "No_show"],
+                zero_division=0,
+            ),
+        }
 
-                    # Calculate AUC-PR
-                    precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
-                    auc_pr = auc(recall, precision)
+    def cross_validate(self, pipeline: Pipeline, X_train: pd.DataFrame, y_train: pd.Series) -> float:
+        scores = cross_val_score(
+            pipeline,
+            X_train,
+            y_train,
+            cv=self.cv_splitter,
+            scoring=self.scoring,
+            n_jobs=1,
+        )
+        return float(scores.mean())
 
-                    tuned_metrics[name] = {
-                        'accuracy': accuracy_score(y_test, y_pred),
-                        'macro_f1': f1_score(y_test, y_pred, average='macro'),
-                        'weighted_f1': f1_score(y_test, y_pred, average='weighted'),
-                        'auc_pr': auc_pr,
-                        'confusion_matrix': confusion_matrix(y_test, y_pred),
-                        'cv_auc_pr': cv_score
-                    }
+    @property
+    def cv_splitter(self) -> StratifiedKFold:
+        return StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
 
-                    tuned_models[name] = best_pipeline
-                    os.makedirs('models', exist_ok=True)
-                    joblib.dump(best_pipeline, f'models/tuned_{name}.pkl')
-                    print(f"\nShow-No_show Report ({name}):")
-                    print(classification_report(y_test, y_pred, target_names=['Show', 'No_show']))
+    @staticmethod
+    def metrics_to_frame(metric_rows: list[dict[str, Any]]) -> pd.DataFrame:
+        metrics_df = pd.DataFrame(metric_rows)
+        if metrics_df.empty:
+            return metrics_df
+        return metrics_df.sort_values("auc_pr", ascending=False).reset_index(drop=True)
 
-                except Exception as e:
-                    logging.error(f"Error tuning {name}: {e}")
-                    continue
+    def save_model(self, pipeline: Pipeline, filename: str) -> None:
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(pipeline, self.models_dir / filename)
 
-            # Print metrics
-            for name, metrics in tuned_metrics.items():
-                print(f"\nModel: {name}")
-                print(f"Accuracy: {metrics['accuracy']:.4f}")
-                print(f"Macro F1: {metrics['macro_f1']:.4f}")
-                print(f"Weighted F1: {metrics['weighted_f1']:.4f}")
-                print(f"CV AUC-PR: {metrics['cv_auc_pr']:.4f}")
-                print("Confusion Matrix:")
-                print(metrics['confusion_matrix'])
-                print(f"AUC-PR: {metrics['auc_pr']:.4f}")
-            
-            logging.info("Hyperparameter tuning completed.")
-            return tuned_models, tuned_metrics
+    def save_metrics(self, metrics_df: pd.DataFrame, filename: str) -> None:
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        metrics_df.to_csv(self.results_dir / filename, index=False)
 
-        except Exception as e:
-            logging.error(f"Error tuning models: {e}")
-            raise
+    @staticmethod
+    def print_report(name: str, metrics: dict[str, Any], tuned: bool = False) -> None:
+        label = "Tuned" if tuned else "Baseline"
+        print(f"\n{label} {name}")
+        print(metrics["classification_report"])
+        print(f"AUC-PR: {metrics['auc_pr']:.4f}")
+        print(f"CV AUC-PR: {metrics['cv_auc_pr']:.4f}")
+        print(f"Confusion matrix: {metrics['confusion_matrix']}")
+
+    @staticmethod
+    def _parameter_space_size(param_grid: dict[str, list[Any]]) -> int:
+        size = 1
+        for values in param_grid.values():
+            size *= len(values)
+        return max(size, 1)
+
+    @staticmethod
+    def _enable_gpu(models: dict[str, Any]) -> None:
+        models["XGBoost"].set_params(device="cuda")
+        models["LightGBM"].set_params(device="gpu")
+        models["CatBoost"].set_params(task_type="GPU", devices="0")

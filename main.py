@@ -1,80 +1,86 @@
-# Standard library imports
-import logging
+"""Run the hotel booking no-show classification pipeline."""
 
-# Third-party imports
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
 import yaml
-import time
-from sklearn.utils._testing import ignore_warnings
-from pathlib import Path 
 
-# Local application/library specific imports
 from src.data_preparation import DataPreparation
 from src.model_training import ModelTraining
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+LOGGER = logging.getLogger(__name__)
+PROJECT_DIR = Path(__file__).resolve().parent
 
-@ignore_warnings(category=Warning) # type: ignore[misc]
-def main():
 
+def load_config(config_path: Path) -> dict[str, Any]:
+    with config_path.open("r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train hotel no-show classification models.")
+    parser.add_argument("--config", default=PROJECT_DIR / "src" / "config.yaml", type=Path)
+    parser.add_argument("--tune", action="store_true", help="Run RandomizedSearchCV after baseline training.")
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU parameters for XGBoost, LightGBM, and CatBoost.")
+    parser.add_argument(
+        "--tune-top-n",
+        type=int,
+        default=None,
+        help="Tune only the top N baseline models by AUC-PR. Defaults to all tuned models in config.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    args = parse_args()
     start_time = time.time()
-    print("Starting full pipeline...")
 
-    # Configuration file path
-    config_path = "./src/config.yaml"
+    config = load_config(args.config)
+    config["use_gpu"] = bool(args.gpu or config.get("use_gpu", False))
+    config["models_dir"] = str(PROJECT_DIR / config.get("models_dir", "models"))
+    config["results_dir"] = str(PROJECT_DIR / config.get("results_dir", "results"))
 
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file)
+    data_path = PROJECT_DIR / config.get("file_path", "data/mini_project_2_data.csv")
+    LOGGER.info("Loading data from %s", data_path)
+    raw_df = pd.read_csv(data_path)
 
-    # Load CSV file into a DataFrame
-    main_dir = Path(__file__).parent
-    data_path = main_dir / "./data/mini_project_2_data.csv"
-    try:
-        df = pd.read_csv(data_path)
-    except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
-        raise ValueError(f"Datafile cannot be loaded: {str(e)}")
+    data_preparation = DataPreparation(config)
+    cleaned_df = data_preparation.clean_data(raw_df)
+    X_train, X_test, y_train, y_test = data_preparation.split_data(cleaned_df)
+    LOGGER.info("Train shape: %s, test shape: %s", X_train.shape, X_test.shape)
+    LOGGER.info("Target distribution: %s", y_train.value_counts(normalize=True).round(3).to_dict())
 
-    # Initialize and run data preparation
-    data_prep = DataPreparation(config)  # type: ignore[misc]
+    model_training = ModelTraining(config, data_preparation.build_preprocessor())
+    _, baseline_metrics = model_training.train_baseline_models(X_train, y_train, X_test, y_test)
 
-    # Clean data and engineeer features
-    cleaned_df = data_prep.clean_data(df)  
+    print("\nBaseline metrics ranked by AUC-PR")
+    print(baseline_metrics[["model", "accuracy", "macro_f1", "weighted_f1", "cv_auc_pr", "auc_pr"]])
 
-    # Split the data
-    X_train, y_train, X_val, y_val, X_test, y_test = data_prep.split_data(cleaned_df)
-    logging.info(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-    logging.info(f"X_train columns: {X_train.columns.tolist()}")
+    if args.tune:
+        tuned_model_names = config.get("tuned_models")
+        if args.tune_top_n:
+            tuned_model_names = baseline_metrics.head(args.tune_top_n)["model"].tolist()
 
-    # Create preprocessors and build pipelines with resampling
-    pipelines = data_prep.build_pipelines_with_resampling(cleaned_df) # type: ignore[misc]
+        _, tuned_metrics = model_training.tune_models(
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            model_names=tuned_model_names,
+        )
+        print("\nTuned metrics ranked by AUC-PR")
+        print(tuned_metrics[["model", "accuracy", "macro_f1", "weighted_f1", "cv_auc_pr", "auc_pr"]])
 
-    # Initialize and run data preparation
-    model_training = ModelTraining(config, pipelines)  # type: ignore[misc]
+    elapsed_minutes = (time.time() - start_time) / 60
+    LOGGER.info("Pipeline finished in %.2f minutes", elapsed_minutes)
 
-    # Train and evaluate baseline models with default hyperparameters
-    baseline_models, baseline_metrics = (model_training.train_and_evaluate_baseline_models(X_train, y_train, X_val, y_val, pipelines)) # type: ignore[misc]
-
-    # Select top 3 baseline models and feed them for tuning.
-    df_metrics = pd.DataFrame.from_dict(baseline_metrics, orient='index') # Convert baseline_metrics to DataFrame (rows: models, columns: metrics)
-    df_auc_pr = df_metrics[['auc_pr']].sort_values('auc_pr', ascending=False) # Select only AUC-PR column and sort descending
-    top_3_models = df_auc_pr.head(3) # Get top 3
-    print("Top 3 Models by AUC-PR:")
-    print(top_3_models)
-    top_3_names = top_3_models.index.tolist() # Extract top 3 model names (from index)
-    top_3_pipelines = {name: baseline_models[name] for name in top_3_names} # Extract top 3 pipelines (dict with only top 3 entries)
-    print(f"\nTop 3 Pipelines Keys: {list(top_3_pipelines.keys())}")
-   
-    # Pass top_3_pipelines, train and evaluate tuned models with hyperparameter tuning
-    tuned_models, tuned_metrics = model_training.train_and_evaluate_tuned_models(X_train, y_train, X_test, y_test, top_3_pipelines)  
-
-    # Log the results
-    logging.info("Baseline Metrics:")
-    logging.info(baseline_metrics)
-    logging.info("Tuned Metrics:") 
-    logging.info(tuned_metrics)
-    logging.info("Tuned Models:") 
-    logging.info(tuned_models)
 
 if __name__ == "__main__":
     main()
-
